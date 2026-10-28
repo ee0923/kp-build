@@ -1,0 +1,174 @@
+name: Build KeePass
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Platforms to build
+        type: choice
+        options: [all, android, desktop, linux, macos, windows]
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keepass-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+  VCPKG_DISABLE_METRICS: '1'
+  HOMEBREW_NO_ANALYTICS: '1'
+  POWERSHELL_TELEMETRY_OPTOUT: '1'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: select
+        env:
+          TARGET: ${{ inputs.target || 'all' }}
+        run: python3 scripts/build-matrix.py "$TARGET" >> "$GITHUB_OUTPUT"
+      - name: Test artifact audit
+        run: >-
+          docker run --rm --network=none -v "$PWD/scripts:/audit:ro"
+          python:3.12-slim python -B /audit/test-artifacts.py
+      - name: Test release publishing
+        run: >-
+          docker run --rm --network=none -v "$PWD/scripts:/audit:ro"
+          python:3.12-slim python -B /audit/test-release.py
+
+  build:
+    name: ${{ matrix.name }} (${{ matrix.arch }})
+    needs: matrix
+    permissions:
+      contents: write
+    env:
+      APP: ${{ matrix.app }}
+      KEEPASS_BUILD_PLATFORM: ${{ matrix.platform }}
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg
+      VCPKG_MAX_CONCURRENCY: '2'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.targets) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    concurrency:
+      group: keepass-${{ github.ref }}-${{ matrix.id }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Clone locked upstream
+        env:
+          APP: ${{ matrix.app }}
+        run: python3 scripts/checkout-source.py "$APP"
+      - name: Customize source
+        env:
+          PATCH_BOOTSTRAP: ${{ secrets[matrix.secret] }}
+        run: bash scripts/apply-patch.sh
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        if: matrix.platform == 'android'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        if: matrix.platform == 'android'
+        with:
+          dotnet-version: '9.0.320'
+      - name: Install pinned Android toolchain
+        if: matrix.platform == 'android'
+        run: |
+          printf '%s\n' '{"sdk":{"version":"9.0.320","rollForward":"disable"}}' > global.json
+          dotnet workload install android --skip-manifest-update
+          "${ANDROID_HOME:?Android SDK required}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" --install \
+            'platforms;android-35' 'platforms;android-36' \
+            'build-tools;34.0.0' 'build-tools;35.0.0' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: bash scripts/setup-linux.sh
+      - name: Install macOS build tools
+        if: matrix.platform == 'macos'
+        run: brew install cmake ninja asciidoctor pkg-config autoconf autoconf-archive automake libtool nasm
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        if: matrix.platform == 'windows'
+        with:
+          arch: x64
+      - name: Install Windows documentation tool
+        if: matrix.platform == 'windows'
+        run: gem install asciidoctor --no-document
+      - name: Clone locked vcpkg
+        if: matrix.platform == 'macos' || matrix.platform == 'windows'
+        run: |
+          python3 scripts/checkout-source.py vcpkg vcpkg
+          mkdir -p .cache/vcpkg
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: matrix.platform == 'macos' || matrix.platform == 'windows'
+        with:
+          path: .cache/vcpkg
+          key: vcpkg-${{ matrix.id }}-${{ runner.arch }}-${{ hashFiles('sources.lock.json') }}-${{ github.run_id }}
+          restore-keys: vcpkg-${{ matrix.id }}-${{ runner.arch }}-${{ hashFiles('sources.lock.json') }}-
+      - name: Bootstrap vcpkg on macOS
+        if: matrix.platform == 'macos'
+        run: bash vcpkg/bootstrap-vcpkg.sh -disableMetrics
+      - name: Bootstrap vcpkg on Windows
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          & .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build
+        run: bash scripts/build.sh build
+      - name: Run tests
+        run: bash scripts/build.sh test
+      - name: Audit
+        run: bash scripts/build.sh audit
+      - name: Package
+        run: bash scripts/build.sh package
+      - name: Upload verified package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.app }}-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish verified package to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: build-${{ github.run_id }}
+          RELEASE_TARGET: ${{ github.sha }}
+          PACKAGE_ID: ${{ matrix.id }}
+        run: bash scripts/publish-release.sh
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: diagnostics-${{ matrix.id }}
+          path: |
+            reports/*.trx
+            build/Testing/Temporary/LastTest.log
+            build/vcpkg-manifest-install.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+          retention-days: 7
