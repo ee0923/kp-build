@@ -1,0 +1,44 @@
+name: Clean workflow history
+
+on:
+  push:
+    paths: ['.github/workflows/cleanup.yml']
+  workflow_run:
+    workflows: [Build KeePass]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  cleanup:
+    name: Remove completed workflow records
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: write
+    steps:
+      - name: Wait for the retention period
+        env:
+          CLEANUP_DELAY: ${{ github.event.workflow_run.conclusion == 'success' && '60' || '1200' }}
+        run: sleep "$CLEANUP_DELAY"
+      - name: Remove completed runs and their logs and artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Snapshot the full list before deleting, so pagination cannot skip old records.
+          gh api --paginate "repos/$GH_REPO/actions/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[] | select((.updated_at | fromdateiso8601) <= (now - (if .conclusion == "success" then 60 else 1200 end))) | .id' \
+            > "$RUNNER_TEMP/completed-runs.txt"
+          while IFS= read -r run_id; do
+            [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || exit 2
+            [[ "$run_id" != "$GITHUB_RUN_ID" ]] || continue
+            if ! result="$(gh api --method DELETE "repos/$GH_REPO/actions/runs/$run_id" 2>&1)"; then
+              # Another cleanup can remove the same completed run first.
+              if [[ "$result" != *"(HTTP 404)"* ]]; then
+                printf '%s\n' "$result" >&2
+                exit 1
+              fi
+            fi
+          done < "$RUNNER_TEMP/completed-runs.txt"

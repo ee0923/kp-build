@@ -1,0 +1,11 @@
+/source/
+/build/
+/stage/
+/dist/
+/reports/
+/vcpkg/
+/.cache/
+/.env
+/.secrets/
+/global.json
+__pycache__/
